@@ -1057,6 +1057,8 @@ struct AcceleratorApp {
     config_path: PathBuf,
     config: AppConfig,
     edge_node_input: String,
+    doh_input: String,
+    dns_hosts_input: String,
     owns_ui_lease: bool,
     ui_lease_stop: Option<Arc<AtomicBool>>,
     status: ServiceState,
@@ -1160,6 +1162,13 @@ impl AcceleratorApp {
         let config = AppConfig::load_or_create(&config_path).unwrap_or_default();
         let autostart_enabled = autostart::is_enabled();
         let edge_node_input = config.edge_node_override().unwrap_or_default().to_string();
+        let doh_input = config.doh_endpoints.join("\n");
+        let dns_hosts_input = config
+            .dns_hosts
+            .iter()
+            .map(|(pattern, target)| format!("{pattern} = {target}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let config_modified_at = file_modified_at(&config_path);
         let status = service::status(Some(config_path.clone())).unwrap_or_default();
         let owns_ui_lease = service::resolve_paths(Some(config_path.clone()))
@@ -1198,6 +1207,8 @@ impl AcceleratorApp {
             config_path,
             config,
             edge_node_input,
+            doh_input,
+            dns_hosts_input,
             owns_ui_lease,
             ui_lease_stop,
             status,
@@ -1262,6 +1273,14 @@ impl AcceleratorApp {
                     .edge_node_override()
                     .unwrap_or_default()
                     .to_string();
+                self.doh_input = self.config.doh_endpoints.join("\n");
+                self.dns_hosts_input = self
+                    .config
+                    .dns_hosts
+                    .iter()
+                    .map(|(pattern, target)| format!("{pattern} = {target}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
             }
             self.config_modified_at = current_config_modified_at;
         }
@@ -1469,11 +1488,6 @@ impl AcceleratorApp {
     }
 
     fn set_edge_node_override(&mut self) {
-        if self.status.running {
-            self.feedback = "请先停止加速，再修改边缘节点".to_string();
-            return;
-        }
-
         let next_value = self.edge_node_input.trim();
         let next_value = if next_value.is_empty() {
             None
@@ -1494,7 +1508,9 @@ impl AcceleratorApp {
                     .edge_node_override()
                     .unwrap_or_default()
                     .to_string();
-                self.feedback = if self.config.edge_node_override().is_some() {
+                self.feedback = if self.status.running {
+                    "已保存边缘节点，加速运行中 2 秒内自动生效".to_string()
+                } else if self.config.edge_node_override().is_some() {
                     format!("已设置边缘节点：{}", self.edge_node_label())
                 } else {
                     "已恢复自动选择边缘节点".to_string()
@@ -1507,10 +1523,6 @@ impl AcceleratorApp {
     }
 
     fn set_ip_preference(&mut self, prefer_ipv6: bool) {
-        if self.status.running {
-            self.feedback = "请先停止加速，再切换 IPv4 / IPv6 优先级".to_string();
-            return;
-        }
         if self.config.managed_prefer_ipv6 == prefer_ipv6 {
             return;
         }
@@ -1518,7 +1530,7 @@ impl AcceleratorApp {
         match self.save_current_config() {
             Ok(()) => {
                 self.feedback = if self.status.running {
-                    format!("已切换为{}，重启加速后生效", self.ip_preference_label())
+                    format!("已切换为{}，加速运行中 2 秒内自动生效", self.ip_preference_label())
                 } else {
                     format!("已切换为{}", self.ip_preference_label())
                 };
@@ -1532,7 +1544,7 @@ impl AcceleratorApp {
     fn render_ip_preference_toggle(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(6.0, 0.0);
-            let ip_toggle_enabled = !self.busy && !self.status.running;
+            let ip_toggle_enabled = !self.busy;
             let ipv4_response = ui.add(ip_priority_button(
                 "IPv4",
                 !self.config.managed_prefer_ipv6,
@@ -2231,6 +2243,63 @@ impl AcceleratorApp {
         });
     }
 
+    fn apply_dns_config_edits(&mut self) {
+        let mut endpoints = Vec::new();
+        for line in self.doh_input.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if !(line.starts_with("http://") || line.starts_with("https://")) {
+                self.feedback = format!("DoH 节点必须以 http(s):// 开头：{line}");
+                return;
+            }
+            endpoints.push(line.to_string());
+        }
+        if endpoints.is_empty() {
+            self.feedback = "至少保留一个 DoH 节点".to_string();
+            return;
+        }
+
+        let mut hosts = std::collections::BTreeMap::new();
+        for (index, line) in self.dns_hosts_input.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((pattern, target)) = line.split_once('=') else {
+                self.feedback = format!(
+                    "dns_hosts 第 {} 行格式错误（应为 域名 = 目标）：{line}",
+                    index + 1
+                );
+                return;
+            };
+            let pattern = pattern.trim();
+            let target = target.trim();
+            if pattern.is_empty() || target.is_empty() {
+                self.feedback = format!("dns_hosts 第 {} 行内容不完整", index + 1);
+                return;
+            }
+            hosts.insert(pattern.to_string(), target.to_string());
+        }
+
+        self.config.doh_endpoints = endpoints;
+        self.config.dns_hosts = hosts;
+        let running_hint = if self.status.running {
+            "（加速运行中，2 秒内自动生效）"
+        } else {
+            ""
+        };
+        match self.save_current_config() {
+            Ok(()) => {
+                self.feedback = format!("已保存 DoH / dns_hosts 配置{running_hint}");
+            }
+            Err(error) => {
+                self.feedback = format!("保存配置失败: {}", format_error_chain(&error));
+            }
+        }
+    }
+
     fn render_config_panel(&mut self, ui: &mut egui::Ui) {
         panel_frame(
             egui::Color32::from_rgb(22, 26, 32),
@@ -2253,7 +2322,7 @@ impl AcceleratorApp {
                     .strong()
                     .color(egui::Color32::from_rgb(160, 170, 178)),
             );
-            let input_enabled = !self.busy && !self.status.running;
+            let input_enabled = !self.busy;
             let input_response = ui.add_enabled(
                 input_enabled,
                 egui::TextEdit::singleline(&mut self.edge_node_input)
@@ -2278,7 +2347,58 @@ impl AcceleratorApp {
                     self.set_edge_node_override();
                 }
             });
-            subtle_note(ui, "边缘节点仅在停止加速后可修改；改完重新开始加速生效。");
+            subtle_note(ui, "加速运行中保存后 2 秒内自动生效，无需重启。");
+            ui.add_space(8.0);
+
+            ui.label(
+                RichText::new(format!(
+                    "DoH 节点（每行一个，共 {} 个）",
+                    self.config.doh_endpoints.len()
+                ))
+                .font(FontId::proportional(11.0))
+                .strong()
+                .color(egui::Color32::from_rgb(160, 170, 178)),
+            );
+            let doh_response = ui.add_enabled(
+                !self.busy,
+                egui::TextEdit::multiline(&mut self.doh_input)
+                    .hint_text("https://doh.example.com/dns-query")
+                    .desired_rows(3)
+                    .desired_width(ui.available_width()),
+            );
+            self.register_drag_blocker(doh_response.rect);
+            ui.add_space(6.0);
+
+            ui.label(
+                RichText::new(format!(
+                    "dns_hosts 静态解析（每行一条，共 {} 条）",
+                    self.config.dns_hosts.len()
+                ))
+                .font(FontId::proportional(11.0))
+                .strong()
+                .color(egui::Color32::from_rgb(160, 170, 178)),
+            );
+            let hosts_response = ui.add_enabled(
+                !self.busy,
+                egui::TextEdit::multiline(&mut self.dns_hosts_input)
+                    .hint_text("例如：linux.do = 104.20.16.234\n支持通配符：*.linux.do = domain:real.example.net")
+                    .desired_rows(3)
+                    .desired_width(ui.available_width()),
+            );
+            self.register_drag_blocker(hosts_response.rect);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let dns_save_response =
+                    ui.add(subtle_button("保存 DoH / dns_hosts", egui::vec2(160.0, 28.0), !self.busy));
+                self.register_drag_blocker(dns_save_response.rect);
+                if dns_save_response.clicked() {
+                    self.apply_dns_config_edits();
+                }
+            });
+            subtle_note(
+                ui,
+                "DoH / dns_hosts / 边缘节点 / IPv4-IPv6 优先级：保存即热加载，2 秒内生效；监听端口、代理域名、证书等修改需重启加速。",
+            );
         });
     }
 

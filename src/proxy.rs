@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -41,7 +41,9 @@ use crate::paths::AppPaths;
 use crate::runtime_log;
 
 struct AppState {
-    config: AppConfig,
+    // Swapped at runtime by the config watcher so DoH endpoints / dns_hosts /
+    // edge_node / IPv6 preference apply without restarting the helper.
+    config: std::sync::RwLock<AppConfig>,
     paths: AppPaths,
     doh_client: Client,
     upstream_tls_connector: TlsConnector,
@@ -49,6 +51,15 @@ struct AppState {
     doh_cache: RwLock<HashMap<DohCacheKey, CachedDohAnswers>>,
     preferred_upstream_addr: RwLock<HashMap<ResolveCacheKey, SocketAddr>>,
     upstream_h2_pool: RwLock<HashMap<H2PoolKey, client_http2::SendRequest<Full<Bytes>>>>,
+}
+
+impl AppState {
+    fn config_snapshot(&self) -> AppConfig {
+        self.config
+            .read()
+            .expect("config lock poisoned")
+            .clone()
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -142,8 +153,9 @@ pub async fn run_proxy(
         .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
         .with_no_client_auth();
     upstream_tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let config_path = paths.config_path.clone();
     let state = Arc::new(AppState {
-        config,
+        config: std::sync::RwLock::new(config),
         paths,
         doh_client,
         upstream_tls_connector: TlsConnector::from(Arc::new(upstream_tls_config)),
@@ -154,20 +166,170 @@ pub async fn run_proxy(
     });
     let http_state = state.clone();
     let https_state = state.clone();
+    let watcher_state = state.clone();
 
     tokio::try_join!(
         run_http_redirect(http_state, shutdown_rx.clone()),
-        run_https_proxy(https_state, bundle, shutdown_rx)
+        run_https_proxy(https_state, bundle, shutdown_rx.clone()),
+        run_config_watcher(watcher_state, config_path, shutdown_rx)
     )?;
 
     Ok(())
+}
+
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+const CONFIG_DEBOUNCE: Duration = Duration::from_millis(600);
+
+/// Polls the config file and hot-applies DNS-layer settings (DoH endpoints,
+/// dns_hosts overrides, edge node, IPv6 preference) without a helper restart.
+/// Listener/hosts/certificate changes are reported as restart-required.
+async fn run_config_watcher(
+    state: Arc<AppState>,
+    config_path: std::path::PathBuf,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    runtime_log::append(
+        &state.paths,
+        "INFO",
+        "config-hot-reload",
+        &format!("配置热加载监视已启动: {}", config_path.display()),
+    );
+    let mut last_modified = config_file_signature(&config_path);
+    loop {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+        tokio::time::sleep(CONFIG_POLL_INTERVAL).await;
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+        let signature = config_file_signature(&config_path);
+        if signature.is_none() || signature == last_modified {
+            continue;
+        }
+        // Debounce: editors often write in multiple steps; wait for the file to settle.
+        tokio::time::sleep(CONFIG_DEBOUNCE).await;
+        let settled = config_file_signature(&config_path);
+        last_modified = settled.or(signature);
+        let Some(_) = settled else {
+            continue;
+        };
+
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(content) => content,
+            Err(error) => {
+                runtime_log::append(
+                    &state.paths,
+                    "WARN",
+                    "config-hot-reload",
+                    &format!("读取配置失败，保留原配置: {error}"),
+                );
+                continue;
+            }
+        };
+        let next = match toml::from_str::<AppConfig>(&content) {
+            Ok(next) => next,
+            Err(error) => {
+                runtime_log::append(
+                    &state.paths,
+                    "WARN",
+                    "config-hot-reload",
+                    &format!("配置解析失败，保留原配置: {error}"),
+                );
+                continue;
+            }
+        };
+
+        let old = state.config_snapshot();
+        let mut applied = old.clone();
+        applied.doh_endpoints = next.doh_endpoints.clone();
+        applied.dns_hosts = next.dns_hosts.clone();
+        applied.edge_node = next.edge_node.clone();
+        applied.managed_prefer_ipv6 = next.managed_prefer_ipv6;
+
+        let changes = describe_config_changes(&old, &applied);
+        if changes.is_empty() {
+            let restart_only = describe_restart_only_changes(&old, &next);
+            if !restart_only.is_empty() {
+                runtime_log::append(
+                    &state.paths,
+                    "INFO",
+                    "config-hot-reload",
+                    &format!("检测到变更但需重启加速才能生效: {restart_only}"),
+                );
+            }
+            continue;
+        }
+
+        *state.config.write().expect("config lock poisoned") = applied;
+        state.resolve_cache.write().await.clear();
+        state.doh_cache.write().await.clear();
+        state.preferred_upstream_addr.write().await.clear();
+        runtime_log::append(
+            &state.paths,
+            "INFO",
+            "config-hot-reload",
+            &format!("已热加载并清空DNS缓存: {changes}"),
+        );
+    }
+}
+
+fn config_file_signature(path: &std::path::Path) -> Option<(SystemTime, u64)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.modified().ok()?, metadata.len()))
+}
+
+fn describe_config_changes(old: &AppConfig, new: &AppConfig) -> String {
+    let mut parts = Vec::new();
+    if old.doh_endpoints != new.doh_endpoints {
+        parts.push(format!("doh_endpoints={:?}", new.doh_endpoints));
+    }
+    if old.dns_hosts != new.dns_hosts {
+        parts.push(format!("dns_hosts={}条", new.dns_hosts.len()));
+    }
+    if old.edge_node_override() != new.edge_node_override() {
+        parts.push(format!(
+            "edge_node={}",
+            new.edge_node_override().unwrap_or("自动")
+        ));
+    }
+    if old.managed_prefer_ipv6 != new.managed_prefer_ipv6 {
+        parts.push(format!("prefer_ipv6={}", new.managed_prefer_ipv6));
+    }
+    parts.join(", ")
+}
+
+fn describe_restart_only_changes(old: &AppConfig, new: &AppConfig) -> String {
+    let mut parts = Vec::new();
+    if old.listen_host != new.listen_host
+        || old.http_port != new.http_port
+        || old.https_port != new.https_port
+    {
+        parts.push("监听地址/端口".to_string());
+    }
+    if old.upstream != new.upstream {
+        parts.push("upstream".to_string());
+    }
+    if old.proxy_domains != new.proxy_domains || old.hosts_domains != new.hosts_domains {
+        parts.push("代理/hosts域名".to_string());
+    }
+    if old.certificate_domains != new.certificate_domains
+        || old.ca_common_name != new.ca_common_name
+    {
+        parts.push("证书配置".to_string());
+    }
+    parts.join("、")
 }
 
 async fn run_http_redirect(
     state: Arc<AppState>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
-    let address = format!("{}:{}", state.config.listen_host, state.config.http_port);
+    let boot_config = state.config_snapshot();
+    let address = format!(
+        "{}:{}",
+        boot_config.listen_host, boot_config.http_port
+    );
     let listener = TcpListener::bind(&address)
         .await
         .with_context(|| format!("failed to bind HTTP listener on {address}"))?;
@@ -220,7 +382,11 @@ async fn run_https_proxy(
     tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let acceptor = TlsAcceptor::from(Arc::new(tls_config));
-    let address = format!("{}:{}", state.config.listen_host, state.config.https_port);
+    let boot_config = state.config_snapshot();
+    let address = format!(
+        "{}:{}",
+        boot_config.listen_host, boot_config.https_port
+    );
     let listener = TcpListener::bind(&address)
         .await
         .with_context(|| format!("failed to bind HTTPS listener on {address}"))?;
@@ -272,18 +438,19 @@ async fn redirect_handler(
     request: Request<Incoming>,
     state: Arc<AppState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let host = extract_host(request.headers(), request.uri(), &state.config)
-        .unwrap_or_else(|| state.config.server_common_name.clone());
+    let config = state.config_snapshot();
+    let host = extract_host(request.headers(), request.uri(), &config)
+        .unwrap_or_else(|| config.server_common_name.clone());
     let path = request
         .uri()
         .path_and_query()
         .map(|value| value.as_str())
         .unwrap_or("/");
 
-    let port = if state.config.https_port == 443 {
+    let port = if config.https_port == 443 {
         String::new()
     } else {
-        format!(":{}", state.config.https_port)
+        format!(":{}", config.https_port)
     };
     let location = format!("https://{host}{port}{path}");
 
@@ -298,7 +465,8 @@ async fn proxy_handler(
     request: Request<Incoming>,
     state: Arc<AppState>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let host = match extract_host(request.headers(), request.uri(), &state.config) {
+    let config = state.config_snapshot();
+    let host = match extract_host(request.headers(), request.uri(), &config) {
         Some(host) => host,
         None => {
             return Ok(simple_response(
@@ -308,7 +476,7 @@ async fn proxy_handler(
         }
     };
 
-    if !state.config.matches_proxy_host(&host) {
+    if !config.matches_proxy_host(&host) {
         return Ok(simple_response(
             StatusCode::BAD_GATEWAY,
             "host is not managed by linuxdo-accelerator",
@@ -329,8 +497,9 @@ async fn forward_request(
     state: &AppState,
     request_host: &str,
 ) -> Result<Response<Full<Bytes>>> {
-    let upstream_url = reqwest::Url::parse(&state.config.upstream)
-        .with_context(|| format!("failed to parse upstream URL {}", state.config.upstream))?;
+    let config = state.config_snapshot();
+    let upstream_url = reqwest::Url::parse(&config.upstream)
+        .with_context(|| format!("failed to parse upstream URL {}", config.upstream))?;
     let upstream_scheme = upstream_url.scheme().to_string();
     let upstream_port = upstream_url
         .port_or_known_default()
@@ -395,6 +564,7 @@ async fn dispatch_upstream_request(
     body: Bytes,
     path_and_query: &str,
 ) -> Result<UpstreamResponse> {
+    let config = state.config_snapshot();
     let upstream = resolve_upstream(state, request_host, upstream_port).await?;
     let ech_config = upstream
         .ech_config
@@ -414,8 +584,7 @@ async fn dispatch_upstream_request(
                 } else {
                     "no"
                 },
-                state
-                    .config
+                config
                     .edge_node_override()
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or("-")
@@ -675,9 +844,9 @@ async fn resolve_upstream(state: &AppState, host: &str, port: u16) -> Result<Res
         });
     }
 
-    let override_host = state.config.find_dns_host_override(host).map(str::to_owned);
-    let edge_override = state
-        .config
+    let config = state.config_snapshot();
+    let override_host = config.find_dns_host_override(host).map(str::to_owned);
+    let edge_override = config
         .edge_node_override()
         .map(parse_dns_host_override)
         .transpose()?;
@@ -818,8 +987,7 @@ async fn resolve_upstream(state: &AppState, host: &str, port: u16) -> Result<Res
             } else {
                 "no"
             },
-            state
-                .config
+            config
                 .edge_node_override()
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or("-")
@@ -846,7 +1014,7 @@ async fn doh_lookup_ip_addrs(
     let (ipv4_answers, ipv6_answers) =
         tokio::try_join!(doh_query(state, host, "A"), doh_query(state, host, "AAAA"))?;
 
-    if state.config.managed_prefer_ipv6 {
+    if state.config_snapshot().managed_prefer_ipv6 {
         for answer in &ipv6_answers {
             if answer.record_type == 28
                 && let Ok(ip) = answer.data.parse::<std::net::Ipv6Addr>()
@@ -916,12 +1084,12 @@ async fn doh_query(state: &AppState, host: &str, record_type: &str) -> Result<Ve
         return Ok(cached);
     }
 
-    if state.config.doh_endpoints.is_empty() {
+    if state.config_snapshot().doh_endpoints.is_empty() {
         anyhow::bail!("DoH 不可用，请在配置中自行更换 DoH：未配置 DoH 端点");
     }
 
     let mut last_error = None;
-    for endpoint in &state.config.doh_endpoints {
+    for endpoint in &state.config_snapshot().doh_endpoints {
         match doh_query_once(&state.doh_client, endpoint, host, record_type).await {
             Ok(answers) => {
                 write_cached_doh_answers(state, cache_key, answers.clone()).await;
